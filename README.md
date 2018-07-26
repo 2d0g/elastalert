@@ -1,3 +1,19 @@
+## rules in es
+add to your config.yaml:
+```
+rules_in_es: true
+```
+
+To add a rule, convert it to JSON:
+
+```
+python -c 'import json,yaml,sys;print json.dumps(yaml.load(sys.stdin.read()))' < test_rule.yaml > test_rule.json
+And insert it to elasticsearch:
+curl -XPOST localhost:9200/elastalert_status/rules/ -d@test_rule.json
+```
+
+
+
 [![Stories in Ready](https://badge.waffle.io/Yelp/elastalert.png?label=ready&title=Ready)](https://waffle.io/Yelp/elastalert)
 [![Stories in In Progress](https://badge.waffle.io/Yelp/elastalert.png?label=in%20progress&title=In%20Progress)](https://waffle.io/Yelp/elastalert)
 [![Build Status](https://travis-ci.org/Yelp/elastalert.svg)](https://travis-ci.org/Yelp/elastalert)

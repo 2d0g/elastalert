@@ -24,6 +24,8 @@ from util import ts_to_dt
 from util import ts_to_dt_with_format
 from util import unix_to_dt
 from util import unixms_to_dt
+from util import elasticsearch_client
+
 
 # schema for rule yaml
 rule_schema = jsonschema.Draft4Validator(yaml.load(open(os.path.join(os.path.dirname(__file__), 'schema.yaml'))))
@@ -451,6 +453,7 @@ def load_rules(args):
     conf.setdefault('scroll_keepalive', '30s')
     conf.setdefault('disable_rules_on_error', True)
     conf.setdefault('scan_subdirectories', True)
+    conf.setdefault('rules_in_es', False)
 
     # Convert run_every, buffer_time into a timedelta object
     try:
@@ -472,23 +475,61 @@ def load_rules(args):
 
     # Load each rule configuration file
     rules = []
-    rule_files = get_file_paths(conf, use_rule)
-    for rule_file in rule_files:
-        try:
-            rule = load_configuration(rule_file, conf, args)
-            # By setting "is_enabled: False" in rule file, a rule is easily disabled
-            if 'is_enabled' in rule and not rule['is_enabled']:
-                continue
+    if conf['rules_in_es']:
+        es = elasticsearch_client(conf)
+        result = es.search(index=conf['writeback_index'],
+                           doc_type='rules',
+                           body={},
+                           size=1000)
+        print result
+        rule_candidates = [hit['_source']for hit in result['hits']['hits']]
+
+        for rule in rule_candidates:
+            rule = init_rule(rule, conf, args)
             if rule['name'] in names:
                 raise EAException('Duplicate rule named %s' % (rule['name']))
-        except EAException as e:
-            raise EAException('Error loading file %s: %s' % (rule_file, e))
 
-        rules.append(rule)
-        names.append(rule['name'])
+            rules.append(rule)
+            names.append(rule['name'])
+
+    else:
+        rule_files = get_file_paths(conf, use_rule)
+        for rule_file in rule_files:
+            try:
+                rule = load_configuration(rule_file, conf, args)
+                # By setting "is_enabled: False" in rule file, a rule is easily disabled
+                if 'is_enabled' in rule and not rule['is_enabled']:
+                    continue
+                if rule['name'] in names:
+                    raise EAException('Duplicate rule named %s' % (rule['name']))
+            except EAException as e:
+                raise EAException('Error loading file %s: %s' % (rule_file, e))
+
+            rules.append(rule)
+            names.append(rule['name'])
 
     conf['rules'] = rules
     return conf
+
+
+def init_rule(rule, conf, args=None):
+    """ Load a yaml rule file and fill in the relevant fields with objects.
+    :param filename: The name of a rule configuration file.
+    :param conf: The global configuration dictionary, used for populating defaults.
+    :return: The rule configuration, a dictionary.
+    """
+    add_rule_hash(rule)
+    load_options_for_esrules(rule, conf, args)
+    load_modules(rule, args)
+    return rule
+
+
+def dict_hash(d):
+    return hash(repr(sorted(d.items())))
+
+
+def add_rule_hash(rule):
+    rule['hash'] = dict_hash(rule)
 
 
 def get_rule_hashes(conf, use_rule=None):
@@ -518,3 +559,172 @@ def adjust_deprecated_values(rule):
         if 'simple_webhook_url' in rule:
             rule['http_post_url'] = rule['simple_webhook_url']
         logging.warning('"simple" alerter has been renamed "post" and comptability may be removed in a future release.')
+
+
+def load_options_for_esrules(rule, conf, args=None):
+    """ Converts time objects, sets defaults, and validates some settings.
+
+    :param rule: A dictionary of parsed YAML from a rule config file.
+    :param conf: The global configuration dictionary, used for populating defaults.
+    """
+    adjust_deprecated_values(rule)
+
+    try:
+        rule_schema.validate(rule)
+    except jsonschema.ValidationError as e:
+        raise EAException("Invalid Rule file: %s\n%s" % (filename, e))
+
+    try:
+        # Set all time based parameters
+        if 'timeframe' in rule:
+            rule['timeframe'] = datetime.timedelta(**rule['timeframe'])
+        if 'realert' in rule:
+            rule['realert'] = datetime.timedelta(**rule['realert'])
+        else:
+            if 'aggregation' in rule:
+                rule['realert'] = datetime.timedelta(minutes=0)
+            else:
+                rule['realert'] = datetime.timedelta(minutes=1)
+        if 'aggregation' in rule and not rule['aggregation'].get('schedule'):
+            rule['aggregation'] = datetime.timedelta(**rule['aggregation'])
+        if 'query_delay' in rule:
+            rule['query_delay'] = datetime.timedelta(**rule['query_delay'])
+        if 'buffer_time' in rule:
+            rule['buffer_time'] = datetime.timedelta(**rule['buffer_time'])
+        if 'bucket_interval' in rule:
+            rule['bucket_interval_timedelta'] = datetime.timedelta(**rule['bucket_interval'])
+        if 'exponential_realert' in rule:
+            rule['exponential_realert'] = datetime.timedelta(**rule['exponential_realert'])
+        if 'kibana4_start_timedelta' in rule:
+            rule['kibana4_start_timedelta'] = datetime.timedelta(**rule['kibana4_start_timedelta'])
+        if 'kibana4_end_timedelta' in rule:
+            rule['kibana4_end_timedelta'] = datetime.timedelta(**rule['kibana4_end_timedelta'])
+    except (KeyError, TypeError) as e:
+        raise EAException('Invalid time format used: %s' % (e))
+
+    # Set defaults, copy defaults from config.yaml
+    for key, val in base_config.items():
+        rule.setdefault(key, val)
+    rule.setdefault('realert', datetime.timedelta(seconds=0))
+    rule.setdefault('aggregation', datetime.timedelta(seconds=0))
+    rule.setdefault('query_delay', datetime.timedelta(seconds=0))
+    rule.setdefault('timestamp_field', '@timestamp')
+    rule.setdefault('filter', [])
+    rule.setdefault('timestamp_type', 'iso')
+    rule.setdefault('timestamp_format', '%Y-%m-%dT%H:%M:%SZ')
+    rule.setdefault('_source_enabled', True)
+    rule.setdefault('use_local_time', True)
+    rule.setdefault('description', "")
+
+    # Set timestamp_type conversion function, used when generating queries and processing hits
+    rule['timestamp_type'] = rule['timestamp_type'].strip().lower()
+    if rule['timestamp_type'] == 'iso':
+        rule['ts_to_dt'] = ts_to_dt
+        rule['dt_to_ts'] = dt_to_ts
+    elif rule['timestamp_type'] == 'unix':
+        rule['ts_to_dt'] = unix_to_dt
+        rule['dt_to_ts'] = dt_to_unix
+    elif rule['timestamp_type'] == 'unix_ms':
+        rule['ts_to_dt'] = unixms_to_dt
+        rule['dt_to_ts'] = dt_to_unixms
+    elif rule['timestamp_type'] == 'custom':
+        def _ts_to_dt_with_format(ts):
+            return ts_to_dt_with_format(ts, ts_format=rule['timestamp_format'])
+
+        def _dt_to_ts_with_format(dt):
+            ts = dt_to_ts_with_format(dt, ts_format=rule['timestamp_format'])
+            if 'timestamp_format_expr' in rule:
+                # eval expression passing 'ts' and 'dt'
+                return eval(rule['timestamp_format_expr'], {'ts': ts, 'dt': dt})
+            else:
+                return ts
+
+        rule['ts_to_dt'] = _ts_to_dt_with_format
+        rule['dt_to_ts'] = _dt_to_ts_with_format
+    else:
+        raise EAException('timestamp_type must be one of iso, unix, or unix_ms')
+
+    # Add support for client ssl certificate auth
+    if 'verify_certs' in conf:
+        rule.setdefault('verify_certs', conf.get('verify_certs'))
+        rule.setdefault('ca_certs', conf.get('ca_certs'))
+        rule.setdefault('client_cert', conf.get('client_cert'))
+        rule.setdefault('client_key', conf.get('client_key'))
+
+    # Set HipChat options from global config
+    rule.setdefault('hipchat_msg_color', 'red')
+    rule.setdefault('hipchat_domain', 'api.hipchat.com')
+    rule.setdefault('hipchat_notify', True)
+    rule.setdefault('hipchat_from', '')
+    rule.setdefault('hipchat_ignore_ssl_errors', False)
+
+    # Make sure we have required options
+    if required_locals - frozenset(rule.keys()):
+        raise EAException('Missing required option(s): %s' % (', '.join(required_locals - frozenset(rule.keys()))))
+
+    if 'include' in rule and type(rule['include']) != list:
+        raise EAException('include option must be a list')
+
+    if isinstance(rule.get('query_key'), list):
+        rule['compound_query_key'] = rule['query_key']
+        rule['query_key'] = ','.join(rule['query_key'])
+
+    if isinstance(rule.get('aggregation_key'), list):
+        rule['compound_aggregation_key'] = rule['aggregation_key']
+        rule['aggregation_key'] = ','.join(rule['aggregation_key'])
+
+    if isinstance(rule.get('compare_key'), list):
+        rule['compound_compare_key'] = rule['compare_key']
+        rule['compare_key'] = ','.join(rule['compare_key'])
+    elif 'compare_key' in rule:
+        rule['compound_compare_key'] = [rule['compare_key']]
+    # Add QK, CK and timestamp to include
+    include = rule.get('include', ['*'])
+    if 'query_key' in rule:
+        include.append(rule['query_key'])
+    if 'compound_query_key' in rule:
+        include += rule['compound_query_key']
+    if 'compound_aggregation_key' in rule:
+        include += rule['compound_aggregation_key']
+    if 'compare_key' in rule:
+        include.append(rule['compare_key'])
+    if 'compound_compare_key' in rule:
+        include += rule['compound_compare_key']
+    if 'top_count_keys' in rule:
+        include += rule['top_count_keys']
+    include.append(rule['timestamp_field'])
+    rule['include'] = list(set(include))
+
+    # Check that generate_kibana_url is compatible with the filters
+    if rule.get('generate_kibana_link'):
+        for es_filter in rule.get('filter'):
+            if es_filter:
+                if 'not' in es_filter:
+                    es_filter = es_filter['not']
+                if 'query' in es_filter:
+                    es_filter = es_filter['query']
+                if es_filter.keys()[0] not in ('term', 'query_string', 'range'):
+                    raise EAException('generate_kibana_link is incompatible with filters other than term, query_string and range. '
+                                      'Consider creating a dashboard and using use_kibana_dashboard instead.')
+
+    # Check that doc_type is provided if use_count/terms_query
+    if rule.get('use_count_query') or rule.get('use_terms_query'):
+        if 'doc_type' not in rule:
+            raise EAException('doc_type must be specified.')
+
+    # Check that query_key is set if use_terms_query
+    if rule.get('use_terms_query'):
+        if 'query_key' not in rule:
+            raise EAException('query_key must be specified with use_terms_query')
+
+    # Warn if use_strf_index is used with %y, %M or %D
+    # (%y = short year, %M = minutes, %D = full date)
+    if rule.get('use_strftime_index'):
+        for token in ['%y', '%M', '%D']:
+            if token in rule.get('index'):
+                logging.warning('Did you mean to use %s in the index? '
+                                'The index will be formatted like %s' % (token,
+                                                                         datetime.datetime.now().strftime(rule.get('index'))))
+
+    if rule.get('scan_entire_timeframe') and not rule.get('timeframe'):
+        raise EAException('scan_entire_timeframe can only be used if there is a timeframe specified')
